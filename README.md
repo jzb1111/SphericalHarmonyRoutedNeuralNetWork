@@ -1,0 +1,2 @@
+# SphericalHarmonyRoutedNeuralNetWork
+SphericalHarmonyRoutedNeuralNetWork is future
