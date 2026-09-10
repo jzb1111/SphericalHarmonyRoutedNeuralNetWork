@@ -196,8 +196,8 @@ class FlatSHSpaceNetwork3D(nn.Module):
         """
         super().__init__()
         self.layer1 = Flat3DSpaceRouteConnect(in_features=784, nex_activate_dim=32, sph_har_n=max_degree)
-        self.layer2 = Flat3DSpaceRouteConnect(in_features=32, nex_activate_dim=10, sph_har_n=max_degree)
-        self.layer3 = Flat3DSpaceRouteConnect(in_features=10, nex_activate_dim=10, sph_har_n=max_degree)
+        self.layer2 = Flat3DSpaceRouteConnect(in_features=32, nex_activate_dim=3, sph_har_n=max_degree)
+        self.layer3 = Flat3DSpaceRouteConnect(in_features=3, nex_activate_dim=10, sph_har_n=max_degree)
         
         # 使用平滑的 SiLU（Swish）作为非线性门控门，相比 ReLU 它在原点附近具备连续二阶导数，更契合球谐函数的平滑连续特性
         self.non_linear_gate = nn.SiLU()

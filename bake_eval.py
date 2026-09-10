@@ -77,12 +77,13 @@ def compute_explicit_sh_basis_4degree(theta, phi):
     return Y
 
 class BakedSHSpaceNetwork3D(nn.Module):
-    def __init__(self, trained_model):
+    def __init__(self, trained_model, grid_res=256):
         super().__init__()
-        self.device = torch.device('cpu')#next(trained_model.parameters()).device
+        self.device = next(trained_model.parameters()).device
         self.non_linear_gate = nn.SiLU()
+        self.grid_res = grid_res
         
-        # 1. 继承原模型的轻量级坐标投影器 (这些在推理时依然需要，用来动态生成寻路 Key)
+        # 1. 继承原模型的轻量级坐标投影器与偏置
         self.route_projector1 = trained_model.layer1.route_projector
         self.route_projector2 = trained_model.layer2.route_projector
         self.route_projector3 = trained_model.layer3.route_projector
@@ -91,90 +92,92 @@ class BakedSHSpaceNetwork3D(nn.Module):
         self.bias2 = trained_model.layer2.bias
         self.bias3 = trained_model.layer3.bias
         
+        # 获取各层的特征维度用来做前向计算
+        self.in_dim_L1 = trained_model.layer1.in_features
+        self.in_dim_L2 = trained_model.layer2.in_features
+        self.in_dim_L3 = trained_model.layer3.in_features
+        self.out_dim_L3 = trained_model.layer3.nex_activate_dim
+
         # =====================================================================
-        # 🪐 2. 核心大招：离线烘焙 (Baking) 过程
+        # 🪐 2. 终极烘焙：将各层球谐场渲染为 100% 纯正的 [512, 512] 各向同性全景地图
         # =====================================================================
-        print("[💾 正在将连续球谐场烘焙为离线流体曲面...]")
+        print(f"[💾 正在唤醒终极双向流体烘焙，网格分辨率: {grid_res}x{grid_res} ...]")
         with torch.no_grad():
-            # 提取原模型中训练好的 16 维球谐系数 [16, 1]
             c1 = trained_model.layer1.Sph_har_engine.sh_coeffs
             c2 = trained_model.layer2.Sph_har_engine.sh_coeffs
             c3 = trained_model.layer3.Sph_har_engine.sh_coeffs
             
-            # 建立固定的行坐标 (纬度 theta)
-            theta_L1 = (0.10 + 0.30 * torch.linspace(0, 1, 784, device=self.device)) * torch.pi
-            theta_L2 = (0.10 + 0.30 * torch.linspace(0, 1, 32, device=self.device)) * torch.pi
-            theta_L3 = (0.10 + 0.30 * torch.linspace(0, 1, 10, device=self.device)) * torch.pi
+            # 建立全景均匀网格（同时用于纬度 theta 和 经度 phi）
+            grid_coord = (0.10 + 0.30 * torch.linspace(0, 1, self.grid_res, device=self.device)) * torch.pi
             
-            # 为了让动态推理实现“查找表”般的极致速度，我们将经度 phi (0到1) 离散化为精细的网格
-            # 这里选择 512 个采样点，足以完美还原 4 阶球谐曲面的光滑低频波形
-            self.grid_res = 512
-            phi_grid = (0.10 + 0.30 * torch.linspace(0, 1, self.grid_res, device=self.device)) * torch.pi
+            # 广播生成各向同性的正方形交叉网格矩阵 [grid_res, grid_res]
+            t_mat = grid_coord.unsqueeze(1).expand(self.grid_res, self.grid_res)
+            p_mat = grid_coord.unsqueeze(0).expand(self.grid_res, self.grid_res)
             
-            # --- 烘焙第一层矩阵曲面 ---
-            # 广播网格计算全图基底
-            t1_mat = theta_L1.unsqueeze(1).expand(784, self.grid_res)
-            p1_mat = phi_grid.unsqueeze(0).expand(784, self.grid_res)
-            Y1 = compute_explicit_sh_basis_4degree(t1_mat.reshape(-1), p1_mat.reshape(-1))
-            # 烘焙结果：[784, 512]，代表 784个特征在 512个物理坐标上的连续权重全景图
-            self.register_buffer('baked_surface_L1', torch.matmul(Y1, c1).reshape(784, self.grid_res))
+            # 全并行计算全景基底场
+            Y_grid = compute_explicit_sh_basis_4degree(t_mat.reshape(-1), p_mat.reshape(-1))
             
-            # --- 烘焙第二层矩阵曲面 ---
-            t2_mat = theta_L2.unsqueeze(1).expand(32, self.grid_res)
-            p2_mat = phi_grid.unsqueeze(0).expand(32, self.grid_res)
-            Y2 = compute_explicit_sh_basis_4degree(t2_mat.reshape(-1), p2_mat.reshape(-1))
-            # 烘焙结果：[32, 512]
-            self.register_buffer('baked_surface_L2', torch.matmul(Y2, c2).reshape(32, self.grid_res))
+            # 将三层不同的球谐场系数直接烙印在 [512, 512] 的静态正方形全景画卷上！
+            # 推理时它们是纯静态数据字典，超越函数计算量彻底为 0
+            self.register_buffer('baked_map_L1', torch.matmul(Y_grid, c1).reshape(self.grid_res, self.grid_res))
+            self.register_buffer('baked_map_L2', torch.matmul(Y_grid, c2).reshape(self.grid_res, self.grid_res))
+            self.register_buffer('baked_map_L3', torch.matmul(Y_grid, c3).reshape(self.grid_res, self.grid_res))
             
-            # --- 烘焙第三层矩阵曲面 ---
-            t3_mat = theta_L3.unsqueeze(1).expand(10, self.grid_res)
-            p3_mat = phi_grid.unsqueeze(0).expand(10, self.grid_res)
-            Y3 = compute_explicit_sh_basis_4degree(t3_mat.reshape(-1), p3_mat.reshape(-1))
-            # 烘焙结果：[10, 512]
-            self.register_buffer('baked_surface_L3', torch.matmul(Y3, c3).reshape(10, self.grid_res))
-            
-        print("[✨ 烘焙大功告成！已成功固化高维空间静态映射表]")
+        print("[✨ 全景双向流体烘焙大功告成！已固化 100% 纯动态路由查找表]")
 
-    def _query_baked_weight(self, baked_surface, keys, target_dim):
-        """ 🚀 高速查表网格线性插值或近似索引用法 """
-        # keys 形状: [B, target_dim]，值在 0 ~ 1 之间
-        # 将 0~1 的连续寻路坐标映射到离散的网格索引 [0, grid_res - 1]
-        idx = (keys * (self.grid_res - 1)).long().clamp(0, self.grid_res - 1) # [B, target_dim]
+    def _query_2d_baked_map(self, baked_map, row_keys, col_keys):
+        """ 🚀 真正的完全体：双向动态连续坐标查表索引切片 """
+        B = row_keys.shape[0]
+        N = row_keys.shape[1]      #% 输入轴特征宽度
+        M = col_keys.shape[1]      #% 输出轴特征宽度
         
-        # 利用高级索引（Advanced Indexing）瞬间切片，提取专属权重矩阵
-        # baked_surface: [In_dim, 512]
-        # 经过切片后直接喷射出：[B, In_dim, target_dim] 的独家样本权重，跳过所有球谐计算！
-        B = keys.shape[0]
-        weight_matrix = baked_surface.unsqueeze(0).expand(B, -1, -1) # [B, In_dim, 512]
+        # 将行与列的双向连续值全部量化映射为全景图的离散网格整数索引
+        row_idx = (row_keys * (self.grid_res - 1)).long().clamp(0, self.grid_res - 1) # [B, N]
+        col_idx = (col_keys * (self.grid_res - 1)).long().clamp(0, self.grid_res - 1) # [B, M]
         
-        # 收集对应坐标处的烘焙特征
-        idx_expanded = idx.unsqueeze(1).expand(-1, baked_surface.shape[0], -1) # [B, In_dim, target_dim]
-        dynamic_weight = torch.gather(weight_matrix, dim=2, index=idx_expanded)
+        # 扩展行索引与列索引，以便利用高级索引在 [512, 512] 图上瞬间切出 [B, N, M] 专属权重
+        # 1. 抽取行：[512, 512] -> 根据 row_idx 抽取出 [B, N, 512]
+        row_idx_expanded = row_idx.unsqueeze(-1).expand(-1, -1, self.grid_res)
+        extracted_rows = torch.gather(baked_map.unsqueeze(0).expand(B, -1, -1), dim=1, index=row_idx_expanded)
+        
+        # 2. 抽取列：[B, N, 512] -> 根据 col_idx 抽取出 [B, N, M] 的终极动态权重
+        col_idx_expanded = col_idx.unsqueeze(1).expand(-1, N, -1)
+        dynamic_weight = torch.gather(extracted_rows, dim=2, index=col_idx_expanded)
+        
         return dynamic_weight
 
     def forward(self, x):
-        B, N = x.shape
-        scale_factor = 1.0 / math.sqrt(N)
+        B, _ = x.shape
         
-        # --- Layer 1 高速推理 ---
+        # =====================================================================
+        # --- Layer 1 高速推理 (Layer 1 的行是固定的 linspace 均匀纬度) ---
+        # =====================================================================
+        # 现场给第一层构造连续的固定行编码 [B, 784]
+        l1_static_row = torch.linspace(0, 1, self.in_dim_L1, device=self.device).unsqueeze(0).expand(B, -1)
         layer1_keys = torch.sigmoid(self.route_projector1(x)) # [B, 32]
-        W1 = self._query_baked_weight(self.baked_surface_L1, layer1_keys, target_dim=32) # [B, 784, 32]
-        res1 = torch.bmm(x.unsqueeze(1), W1).squeeze(1) * scale_factor + self.bias1
+        
+        W1 = self._query_2d_baked_map(self.baked_map_L1, l1_static_row, layer1_keys) # [B, 784, 32]
+        res1 = torch.bmm(x.unsqueeze(1), W1).squeeze(1) * (1.0 / math.sqrt(self.in_dim_L1)) + self.bias1
         res1 = self.non_linear_gate(res1)
         
-        # --- Layer 2 高速推理 ---
-        layer2_keys = torch.sigmoid(self.route_projector2(res1)) # [B, 10]
-        W2 = self._query_baked_weight(self.baked_surface_L2, layer2_keys, target_dim=10) # [B, 32, 10]
-        res2 = torch.bmm(res1.unsqueeze(1), W2).squeeze(1) * (1.0 / math.sqrt(32)) + self.bias2
+        # =====================================================================
+        # --- Layer 2 高速推理 (🚨 真正的灵魂：行的纬度直接用上一层的 layer1_keys！) ---
+        # =====================================================================
+        layer2_keys = torch.sigmoid(self.route_projector2(res1)) # [B, 3] (或10)
+        
+        W2 = self._query_2d_baked_map(self.baked_map_L2, layer1_keys, layer2_keys) # [B, 32, 3]
+        res2 = torch.bmm(res1.unsqueeze(1), W2).squeeze(1) * (1.0 / math.sqrt(self.in_dim_L2)) + self.bias2
         res2 = self.non_linear_gate(res2)
         
-        # --- Layer 3 高速推理 ---
+        # =====================================================================
+        # --- Layer 3 高速推理 (🚨 行的纬度用上一层的 layer2_keys！) ---
+        # =====================================================================
         layer3_keys = torch.sigmoid(self.route_projector3(res2)) # [B, 10]
-        W3 = self._query_baked_weight(self.baked_surface_L3, layer3_keys, target_dim=10) # [B, 10, 10]
-        logits = torch.bmm(res2.unsqueeze(1), W3).squeeze(1) * (1.0 / math.sqrt(10)) + self.bias3
         
-        keys=[layer1_keys, layer2_keys, layer3_keys]
-        return logits, keys
+        W3 = self._query_2d_baked_map(self.baked_map_L3, layer2_keys, layer3_keys) # [B, 3, 10]
+        logits = torch.bmm(res2.unsqueeze(1), W3).squeeze(1) * (1.0 / math.sqrt(self.in_dim_L3)) + self.bias3
+        keys=[layer1_keys,layer2_keys,layer3_keys]
+        return logits,keys
 
 # 使用方法示例：
 # inference_model = BakedSHSpaceNetwork3D(model).to(device)
